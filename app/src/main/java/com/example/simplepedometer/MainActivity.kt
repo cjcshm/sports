@@ -2,6 +2,7 @@ package com.example.simplepedometer
 
 import android.Manifest
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.hardware.Sensor
 import android.hardware.SensorEvent
@@ -10,7 +11,9 @@ import android.hardware.SensorManager
 import android.os.Build
 import android.os.Bundle
 import android.widget.TextView
+import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import java.text.SimpleDateFormat
@@ -42,6 +45,17 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         tvTodaySteps = findViewById(R.id.tv_today_steps)
         tvStatus = findViewById(R.id.tv_status)
         tvHistory = findViewById(R.id.tv_history)
+
+        // 短按歷史紀錄：呼叫系統分享匯出（零檔案佔用）
+        tvHistory.setOnClickListener {
+            exportHistory()
+        }
+
+        // 長按歷史紀錄：跳出刪除單筆或全部清空選單
+        tvHistory.setOnLongClickListener {
+            showDeleteDialog()
+            true
+        }
 
         sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
         stepSensor = sensorManager.getDefaultSensor(Sensor.TYPE_STEP_COUNTER)
@@ -148,7 +162,75 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             val steps = allEntries[date] as? Int ?: 0
             sb.append("$date  ：  ${String.format("%,d", steps)} 步\n")
         }
+        sb.append("\n（點一下匯出分享｜長按可刪除紀錄）")
         tvHistory.text = sb.toString().trim()
+    }
+
+    // 匯出歷史紀錄（呼叫系統分享選單）
+    private fun exportHistory() {
+        val historyPrefs = getSharedPreferences("StepHistoryPrefs", Context.MODE_PRIVATE)
+        val allEntries = historyPrefs.all
+        if (allEntries.isEmpty()) {
+            Toast.makeText(this, "目前沒有可匯出的歷史紀錄", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        val sortedDates = allEntries.keys.sortedDescending()
+        val sb = StringBuilder("日期,步數\n")
+        for (date in sortedDates) {
+            val steps = allEntries[date] as? Int ?: 0
+            sb.append("$date,$steps\n")
+        }
+
+        val sendIntent = Intent(Intent.ACTION_SEND).apply {
+            type = "text/plain"
+            putExtra(Intent.EXTRA_SUBJECT, "計步器歷史紀錄")
+            putExtra(Intent.EXTRA_TEXT, sb.toString().trim())
+        }
+        startActivity(Intent.createChooser(sendIntent, "匯出歷史紀錄至..."))
+    }
+
+    // 刪除單筆或全部歷史紀錄
+    private fun showDeleteDialog() {
+        val historyPrefs = getSharedPreferences("StepHistoryPrefs", Context.MODE_PRIVATE)
+        val allEntries = historyPrefs.all
+        if (allEntries.isEmpty()) {
+            Toast.makeText(this, "目前沒有可刪除的歷史紀錄", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        val sortedDates = allEntries.keys.sortedDescending()
+        val items = sortedDates.map { date ->
+            val steps = allEntries[date] as? Int ?: 0
+            "$date  (${String.format("%,d", steps)} 步)"
+        }.toMutableList()
+        items.add("全部清空所有歷史紀錄")
+
+        AlertDialog.Builder(this)
+            .setTitle("選擇要刪除的紀錄")
+            .setItems(items.toTypedArray()) { _, which ->
+                if (which == items.lastIndex) {
+                    // 二次確認全部清空
+                    AlertDialog.Builder(this)
+                        .setTitle("確認清空")
+                        .setMessage("確定要刪除所有歷史紀錄嗎？此動作無法復原。")
+                        .setPositiveButton("確定清空") { _, _ ->
+                            historyPrefs.edit().clear().apply()
+                            loadAndDisplayHistory()
+                            Toast.makeText(this, "已清空所有歷史紀錄", Toast.LENGTH_SHORT).show()
+                        }
+                        .setNegativeButton("取消", null)
+                        .show()
+                } else {
+                    // 刪除單筆特定日期
+                    val targetDate = sortedDates[which]
+                    historyPrefs.edit().remove(targetDate).apply()
+                    loadAndDisplayHistory()
+                    Toast.makeText(this, "已刪除 $targetDate 的紀錄", Toast.LENGTH_SHORT).show()
+                }
+            }
+            .setNegativeButton("取消", null)
+            .show()
     }
 
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
