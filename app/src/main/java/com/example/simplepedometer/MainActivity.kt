@@ -2,6 +2,7 @@ package com.example.simplepedometer
 
 import android.Manifest
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.hardware.Sensor
 import android.hardware.SensorEvent
@@ -11,7 +12,9 @@ import android.os.Build
 import android.os.Bundle
 import android.os.SystemClock
 import android.widget.TextView
+import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.work.ExistingPeriodicWorkPolicy
@@ -53,12 +56,23 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         tvStatus = findViewById(R.id.tv_status)
         tvHistory = findViewById(R.id.tv_history)
 
-        // 先顯示目前已儲存的今日步數（避免剛打開畫面顯示 0）
+        // 顯示目前已儲存的今日步數
         val prefs = getSharedPreferences("StepCounterPrefs", Context.MODE_PRIVATE)
         val todayDate = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date())
         if (prefs.getString("last_date", "") == todayDate) {
             val savedSteps = prefs.getInt("today_steps", 0)
             tvTodaySteps.text = String.format("%,d", savedSteps)
+        }
+
+        // 短按歷史紀錄：呼叫系統分享匯出（CSV 格式）
+        tvHistory.setOnClickListener {
+            exportHistory()
+        }
+
+        // 長按歷史紀錄：跳出單筆刪除或全部清空選單
+        tvHistory.setOnLongClickListener {
+            showDeleteDialog()
+            true
         }
 
         sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
@@ -107,7 +121,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         }
     }
 
-    // 設定每天晚上 23:50 自動在背景結算當日步數（執行完立刻休眠，不常駐）
+    // 每天晚上 23:50 自動在背景結算當日步數
     private fun scheduleDailyMidnightSync() {
         val currentTime = Calendar.getInstance()
         val dueTime = Calendar.getInstance().apply {
@@ -157,13 +171,79 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             val steps = allEntries[date] as? Int ?: 0
             sb.append("$date  ：  ${String.format("%,d", steps)} 步\n")
         }
+        sb.append("\n（點一下匯出分享｜長按可刪除紀錄）")
         tvHistory.text = sb.toString().trim()
+    }
+
+    // 短按：呼叫系統分享匯出 CSV 格式
+    private fun exportHistory() {
+        val historyPrefs = getSharedPreferences("StepHistoryPrefs", Context.MODE_PRIVATE)
+        val allEntries = historyPrefs.all
+        if (allEntries.isEmpty()) {
+            Toast.makeText(this, "目前沒有可匯出的歷史紀錄", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        val sortedDates = allEntries.keys.sortedDescending()
+        val sb = StringBuilder("日期,步數\n")
+        for (date in sortedDates) {
+            val steps = allEntries[date] as? Int ?: 0
+            sb.append("$date,$steps\n")
+        }
+
+        val sendIntent = Intent(Intent.ACTION_SEND).apply {
+            type = "text/plain"
+            putExtra(Intent.EXTRA_SUBJECT, "計步器歷史紀錄")
+            putExtra(Intent.EXTRA_TEXT, sb.toString().trim())
+        }
+        startActivity(Intent.createChooser(sendIntent, "匯出歷史紀錄至..."))
+    }
+
+    // 長按：單筆刪除或全部清空選單
+    private fun showDeleteDialog() {
+        val historyPrefs = getSharedPreferences("StepHistoryPrefs", Context.MODE_PRIVATE)
+        val allEntries = historyPrefs.all
+        if (allEntries.isEmpty()) {
+            Toast.makeText(this, "目前沒有可刪除的歷史紀錄", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        val sortedDates = allEntries.keys.sortedDescending()
+        val items = sortedDates.map { date ->
+            val steps = allEntries[date] as? Int ?: 0
+            "$date  (${String.format("%,d", steps)} 步)"
+        }.toMutableList()
+        items.add("全部清空所有歷史紀錄")
+
+        AlertDialog.Builder(this)
+            .setTitle("選擇要刪除的紀錄")
+            .setItems(items.toTypedArray()) { _, which ->
+                if (which == items.lastIndex) {
+                    AlertDialog.Builder(this)
+                        .setTitle("確認清空")
+                        .setMessage("確定要刪除所有歷史紀錄嗎？此動作無法復原。")
+                        .setPositiveButton("確定清空") { _, _ ->
+                            historyPrefs.edit().clear().apply()
+                            loadAndDisplayHistory()
+                            Toast.makeText(this, "已清空所有歷史紀錄", Toast.LENGTH_SHORT).show()
+                        }
+                        .setNegativeButton("取消", null)
+                        .show()
+                } else {
+                    val targetDate = sortedDates[which]
+                    historyPrefs.edit().remove(targetDate).apply()
+                    loadAndDisplayHistory()
+                    Toast.makeText(this, "已刪除 $targetDate 的紀錄", Toast.LENGTH_SHORT).show()
+                }
+            }
+            .setNegativeButton("取消", null)
+            .show()
     }
 
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
 }
 
-// 共用的步數計算與重開機校正核心（前台與背景排程共用）
+// 步數計算與重開機校正核心
 object StepStorageHelper {
     fun processAndSaveSteps(context: Context, totalSinceBoot: Int): Int {
         val prefs = context.getSharedPreferences("StepCounterPrefs", Context.MODE_PRIVATE)
@@ -179,12 +259,10 @@ object StepStorageHelper {
         val hasRebooted = Math.abs(currentBootTime - lastBootTime) > 5000L
 
         if (savedDate != todayDate) {
-            // 跨日歸檔：把前一天的最終步數寫入歷史紀錄
             if (!savedDate.isNullOrEmpty()) {
                 val historyPrefs = context.getSharedPreferences("StepHistoryPrefs", Context.MODE_PRIVATE)
                 historyPrefs.edit().putInt(savedDate, savedTodaySteps).apply()
             }
-            // 新的一天起算
             baselineSteps = if (hasRebooted) 0 else totalSinceBoot
             savedTodaySteps = totalSinceBoot - baselineSteps
             if (savedTodaySteps < 0) {
@@ -199,7 +277,6 @@ object StepStorageHelper {
                 .putLong("last_boot_time", currentBootTime)
                 .apply()
         } else if (hasRebooted || baselineSteps == -1 || totalSinceBoot < baselineSteps) {
-            // 同一天但手機曾重開機：保留關機前累積的步數，重新校正基準點
             baselineSteps = totalSinceBoot - savedTodaySteps
             prefs.edit()
                 .putInt("baseline_steps", baselineSteps)
@@ -216,7 +293,7 @@ object StepStorageHelper {
     }
 }
 
-// 每日定時背景結算任務（喚醒 1 秒讀取硬體步數並存檔，完成後立刻休眠）
+// 每日定時背景結算任務
 class DailyStepWorker(context: Context, workerParams: WorkerParameters) : Worker(context, workerParams) {
     override fun doWork(): Result {
         val sensorManager = applicationContext.getSystemService(Context.SENSOR_SERVICE) as SensorManager
@@ -237,7 +314,6 @@ class DailyStepWorker(context: Context, workerParams: WorkerParameters) : Worker
         }
 
         sensorManager.registerListener(listener, stepSensor, SensorManager.SENSOR_DELAY_NORMAL)
-        // 最多等待 3 秒取得硬體讀數，取得後立刻釋放資源休眠
         latch.await(3, TimeUnit.SECONDS)
         sensorManager.unregisterListener(listener)
 
